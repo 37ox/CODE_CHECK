@@ -84,6 +84,19 @@ CPP_KEYWORDS = {
     "false",
 }
 
+NON_DECL_STMT_KEYWORDS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "case",
+    "throw",
+    "sizeof",
+    "delete",
+    "new",
+}
+
 INDEX_ACCESS_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\[\s*([^\]\n]+?)\s*\]")
 SMALL_DENOMINATOR_EPS = 1e-20
 INTEGER_TYPE_RE = re.compile(
@@ -112,8 +125,8 @@ FULLWIDTH_TRANSLATION = str.maketrans(
 RISK_TYPE_ZH = {
     "null_pointer_risk": "空指针风险",
     "out_of_bounds_risk": "数组越界风险",
-    "divide_by_zero_risk": "除零风险",
-    "small_denominator_risk": "近零除数风险",
+    "divide_by_zero_risk": "除0风险",
+    "small_denominator_risk": "除0风险",
 }
 
 SCAN_MODE_ZH = {
@@ -854,6 +867,17 @@ def looks_like_integer_literal(expr: str) -> bool:
     return bool(re.fullmatch(r"(0x[0-9a-f]+|\d+)(u|ul|ull|l|ll)?", e))
 
 
+def parse_integer_literal(expr: str) -> Optional[int]:
+    e = strip_wrapping_parentheses(expr).strip().lower().replace("_", "")
+    m = re.fullmatch(r"([+-]?(?:0x[0-9a-f]+|\d+))(?:u|ul|ull|l|ll)?", e)
+    if not m:
+        return None
+    try:
+        return int(m.group(1), 0)
+    except ValueError:
+        return None
+
+
 def extract_identifiers(expr: str) -> List[str]:
     ids = re.findall(r"[A-Za-z_]\w*", expr)
     return [x for x in ids if x not in CPP_KEYWORDS]
@@ -908,6 +932,121 @@ def is_integer_index_expr(
     return True
 
 
+def infer_integer_symbol_literal(symbol: str, lines: Sequence[str], line_no0: int) -> Optional[int]:
+    s_re = re.escape(symbol)
+    value: Optional[int] = None
+    assign_re = re.compile(rf"\b{s_re}\b\s*=(?!=)\s*([^,;)\s]+)")
+
+    for i in range(0, line_no0 + 1):
+        line = lines[i]
+        for m in assign_re.finditer(line):
+            parsed = parse_integer_literal(m.group(1))
+            if parsed is not None:
+                value = parsed
+    return value
+
+
+def is_array_declaration_occurrence(line: str, match_start: int, match_end: int) -> bool:
+    """
+    Heuristic: treat `name[sz]` as declaration declarator (not index access).
+    Example: `Type arr[6] = {...};`
+    """
+    prefix = line[:match_start]
+    suffix = line[match_end:]
+    suffix_l = suffix.lstrip()
+
+    if not suffix_l or not suffix_l.startswith((";", ",", "=", "{")):
+        return False
+
+    if "->" in prefix or "." in prefix:
+        return False
+    if re.search(r"[=()+\-/%?:]", prefix):
+        return False
+
+    words = re.findall(r"[A-Za-z_]\w*", prefix)
+    if not words:
+        return False
+    if any(w in NON_DECL_STMT_KEYWORDS for w in words):
+        return False
+
+    return True
+
+
+def infer_container_literal_size(container: str, lines: Sequence[str], line_no0: int) -> Optional[int]:
+    c_re = re.escape(container)
+    known_size: Optional[int] = None
+
+    for i in range(0, line_no0 + 1):
+        line = lines[i]
+
+        m_ctor_decl = re.search(
+            rf"\b(?:std::)?vector\s*<[^>]+>\s*\b{c_re}\b\s*\(\s*([^,\)\s]+)",
+            line,
+        )
+        if m_ctor_decl:
+            parsed = parse_integer_literal(m_ctor_decl.group(1))
+            known_size = parsed if parsed is not None and parsed >= 0 else None
+
+        m_ctor_assign = re.search(
+            rf"\b{c_re}\b\s*=(?!=)\s*(?:std::)?vector\s*<[^>]+>\s*\(\s*([^,\)\s]+)",
+            line,
+        )
+        if m_ctor_assign:
+            parsed = parse_integer_literal(m_ctor_assign.group(1))
+            known_size = parsed if parsed is not None and parsed >= 0 else None
+
+        m_resize = re.search(rf"\b{c_re}\b\s*(?:\.|->)\s*resize\s*\(\s*([^,\)\s]+)", line)
+        if m_resize:
+            parsed = parse_integer_literal(m_resize.group(1))
+            known_size = parsed if parsed is not None and parsed >= 0 else None
+
+        if re.search(rf"\b{c_re}\b\s*(?:\.|->)\s*clear\s*\(\s*\)", line):
+            known_size = 0
+
+        m_c_array = re.search(
+            rf"\b[A-Za-z_]\w*(?:\s*[*&])?\s+\b{c_re}\b\s*\[\s*([^\]]+)\s*\]",
+            line,
+        )
+        if m_c_array:
+            parsed = parse_integer_literal(m_c_array.group(1))
+            known_size = parsed if parsed is not None and parsed >= 0 else None
+
+    return known_size
+
+
+def resolve_upper_bound_token(token: str, lines: Sequence[str], line_no0: int) -> Optional[int]:
+    parsed = parse_integer_literal(token)
+    if parsed is not None:
+        return parsed
+    if re.fullmatch(r"[A-Za-z_]\w*", token):
+        return infer_integer_symbol_literal(token, lines, line_no0)
+    return None
+
+
+def evaluate_literal_index_against_container_size(
+    index_expr: str,
+    container: str,
+    lines: Sequence[str],
+    line_no0: int,
+) -> Tuple[bool, Optional[bool], Optional[int], Optional[int]]:
+    """
+    Returns:
+    - is_literal: whether index_expr is a parsed integer literal
+    - in_bounds: for literal with known size, whether 0 <= idx < size; else None
+    - literal_index: parsed integer literal value (if any)
+    - known_size: inferred container size up to current line (if any)
+    """
+    literal_index = parse_integer_literal(index_expr)
+    if literal_index is None:
+        return (False, None, None, None)
+
+    known_size = infer_container_literal_size(container, lines, line_no0)
+    if known_size is None:
+        return (True, None, literal_index, None)
+
+    return (True, 0 <= literal_index < known_size, literal_index, known_size)
+
+
 def has_bounds_guard(index_expr: str, container: str, lines: Sequence[str], line_no0: int) -> bool:
     ids = extract_identifiers(index_expr)
     if not ids:
@@ -916,15 +1055,13 @@ def has_bounds_guard(index_expr: str, container: str, lines: Sequence[str], line
     start = max(0, line_no0 - 10)
     context = "\n".join(lines[start : line_no0 + 1])
     c_re = re.escape(container)
+    known_size = infer_container_literal_size(container, lines, line_no0)
 
     for idx in ids:
         i_re = re.escape(idx)
         upper_checks = [
             rf"\b{i_re}\b\s*<\s*\b{c_re}\b\s*(?:\.|->)\s*(?:size|length)\s*\(",
             rf"\b{c_re}\b\s*(?:\.|->)\s*(?:size|length)\s*\(\s*\)\s*>\s*\b{i_re}\b",
-            rf"\b{i_re}\b\s*<\s*[A-Za-z_]\w*\s*(?:\.|->)\s*(?:size|length)\s*\(",
-            rf"\b{i_re}\b\s*<\s*[A-Za-z_]\w*(?:Size|Count|Length|MAX|max)\b",
-            rf"\b{i_re}\b\s*<\s*[A-Za-z_]\w+\b",
         ]
         lower_checks = [
             rf"\b{i_re}\b\s*>=\s*0\b",
@@ -963,6 +1100,77 @@ def has_bounds_guard(index_expr: str, container: str, lines: Sequence[str], line
             upper_ok = True
         if lower_reject:
             lower_ok = True
+
+        # Literal/symbol bound check tied to known container size.
+        if known_size is not None and known_size >= 0:
+            upper_from_literal_or_symbol = False
+            for j in range(start, line_no0 + 1):
+                line = lines[j]
+
+                m_lt = re.search(rf"\b{i_re}\b\s*<\s*([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)", line)
+                if m_lt:
+                    b = resolve_upper_bound_token(m_lt.group(1), lines, j)
+                    if b is not None and b <= known_size:
+                        upper_from_literal_or_symbol = True
+
+                m_gt = re.search(rf"([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)\s*>\s*\b{i_re}\b", line)
+                if m_gt:
+                    b = resolve_upper_bound_token(m_gt.group(1), lines, j)
+                    if b is not None and b <= known_size:
+                        upper_from_literal_or_symbol = True
+
+                m_le = re.search(rf"\b{i_re}\b\s*<=\s*([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)", line)
+                if m_le:
+                    b = resolve_upper_bound_token(m_le.group(1), lines, j)
+                    if b is not None and (b + 1) <= known_size:
+                        upper_from_literal_or_symbol = True
+
+                m_ge = re.search(rf"([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)\s*>=\s*\b{i_re}\b", line)
+                if m_ge:
+                    b = resolve_upper_bound_token(m_ge.group(1), lines, j)
+                    if b is not None and (b + 1) <= known_size:
+                        upper_from_literal_or_symbol = True
+
+                if has_flow_exit_nearby(lines, j):
+                    m_rej_ge = re.search(
+                        rf"\b{i_re}\b\s*>=\s*([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)",
+                        line,
+                    )
+                    if m_rej_ge:
+                        b = resolve_upper_bound_token(m_rej_ge.group(1), lines, j)
+                        if b is not None and b <= known_size:
+                            upper_from_literal_or_symbol = True
+
+                    m_rej_le = re.search(
+                        rf"([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)\s*<=\s*\b{i_re}\b",
+                        line,
+                    )
+                    if m_rej_le:
+                        b = resolve_upper_bound_token(m_rej_le.group(1), lines, j)
+                        if b is not None and b <= known_size:
+                            upper_from_literal_or_symbol = True
+
+                    m_rej_gt = re.search(
+                        rf"\b{i_re}\b\s*>\s*([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)",
+                        line,
+                    )
+                    if m_rej_gt:
+                        b = resolve_upper_bound_token(m_rej_gt.group(1), lines, j)
+                        if b is not None and (b + 1) <= known_size:
+                            upper_from_literal_or_symbol = True
+
+                    m_rej_lt = re.search(
+                        rf"([A-Za-z_]\w*|[-+]?(?:0x[0-9A-Fa-f]+|\d+)[uUlL]*)\s*<\s*\b{i_re}\b",
+                        line,
+                    )
+                    if m_rej_lt:
+                        b = resolve_upper_bound_token(m_rej_lt.group(1), lines, j)
+                        if b is not None and (b + 1) <= known_size:
+                            upper_from_literal_or_symbol = True
+
+            if upper_from_literal_or_symbol:
+                upper_ok = True
+
         if upper_ok and lower_ok:
             return True
     return False
@@ -1049,6 +1257,55 @@ def parse_condition_expr(expr: str):
     if s.startswith("!") and not s.startswith("!="):
         return ("not", parse_condition_expr(s[1:].strip()))
     return ("atom", s)
+
+
+def compact_expr_text(expr: str) -> str:
+    return re.sub(r"\s+", "", strip_wrapping_parentheses(normalize_condition_text(expr)))
+
+
+def parse_is_equal_call_args(expr: str) -> Optional[Tuple[str, str]]:
+    s = strip_wrapping_parentheses(normalize_condition_text(expr))
+    m = re.fullmatch(r"(?:[A-Za-z_]\w*::)?isEqual\s*\((.*)\)", s)
+    if not m:
+        return None
+    parts = split_top_level(m.group(1), ",")
+    if len(parts) != 2:
+        return None
+    return parts[0].strip(), parts[1].strip()
+
+
+def expr_matches_difference(expr: str, lhs: str, rhs: str) -> bool:
+    e = compact_expr_text(expr)
+    l = compact_expr_text(lhs)
+    r = compact_expr_text(rhs)
+    if not e or not l or not r:
+        return False
+    return e == f"{l}-{r}" or e == f"{r}-{l}"
+
+
+def atom_implies_expr_near_zero(expr: str, atom: str) -> bool:
+    args = parse_is_equal_call_args(atom)
+    if not args:
+        return False
+    lhs, rhs = args
+    return expr_matches_difference(expr, lhs, rhs)
+
+
+def condition_implies_expr_away_from_zero(expr: str, cond: str) -> bool:
+    def implies(node) -> bool:
+        kind = node[0]
+        if kind == "atom":
+            return False
+        if kind == "not":
+            child = node[1]
+            return child[0] == "atom" and atom_implies_expr_near_zero(expr, child[1])
+        if kind == "and":
+            return any(implies(child) for child in node[1])
+        if kind == "or":
+            return all(implies(child) for child in node[1])
+        return False
+
+    return implies(parse_condition_expr(cond))
 
 
 def interval_set_universe() -> List[Tuple[Optional[float], bool, Optional[float], bool]]:
@@ -1203,6 +1460,28 @@ def atom_interval_set_for_var(
     v_re = re.escape(var)
     num = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?[fFlL]?"
     reverse = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+
+    if re.fullmatch(rf"\b{v_re}\b", s):
+        return comparison_interval_set("!=", 0.0)
+
+    is_equal_call = re.fullmatch(
+        r"(?:[A-Za-z_]\w*::)?isEqual\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)",
+        s,
+    )
+    if is_equal_call:
+        lhs = strip_wrapping_parentheses(is_equal_call.group(1))
+        rhs = strip_wrapping_parentheses(is_equal_call.group(2))
+        if re.fullmatch(rf"\b{v_re}\b", lhs):
+            v = parse_float_literal(rhs)
+            if v is not None:
+                eps = SMALL_DENOMINATOR_EPS
+                return [(v - eps, False, v + eps, False)]
+        if re.fullmatch(rf"\b{v_re}\b", rhs):
+            v = parse_float_literal(lhs)
+            if v is not None:
+                eps = SMALL_DENOMINATOR_EPS
+                return [(v - eps, False, v + eps, False)]
+        return None
 
     abs_left = re.fullmatch(
         rf"(?:std::)?(?:abs|fabs)\s*\(\s*\b{v_re}\b\s*\)\s*(<=|>=|<|>|==|!=)\s*({num})",
@@ -1392,12 +1671,20 @@ def condition_implies_away_from_zero(var: str, cond: str, eps: float) -> bool:
     return interval_set_away_from_zero(interval_set, eps)
 
 
-def has_nonzero_guard(var: str, lines: Sequence[str], use_line: int) -> bool:
+def has_nonzero_guard(
+    var: str,
+    lines: Sequence[str],
+    use_line: int,
+    active_conds_on_use_line: Optional[Sequence[str]] = None,
+) -> bool:
     v_re = re.escape(var)
     cond_nonzero = re.compile(rf"(?:\b{v_re}\b\s*!=\s*0|0\s*!=\s*\b{v_re}\b)")
     cond_zero = re.compile(rf"(?:\b{v_re}\b\s*==\s*0|0\s*==\s*\b{v_re}\b)")
     assert_nonzero = re.compile(rf"\b(?:assert|CHECK)\s*\(\s*\b{v_re}\b(?:\s*!=\s*0)?\s*\)")
-    if_truthy = re.compile(rf"\bif\s*\([^)]*\b{v_re}\b[^)]*\)")
+    active_cond_keys = {
+        normalize_condition_text(strip_wrapping_parentheses(c)).strip()
+        for c in (active_conds_on_use_line or [])
+    }
     start = max(0, use_line - 10)
     for i in range(start, use_line + 1):
         line = lines[i]
@@ -1405,12 +1692,13 @@ def has_nonzero_guard(var: str, lines: Sequence[str], use_line: int) -> bool:
             return True
         if cond_nonzero.search(line):
             return True
-        if if_truthy.search(line) and "==" not in line and "!=" not in line and "!" not in line:
-            return True
         if cond_zero.search(line) and has_flow_exit_nearby(lines, i):
             return True
         if has_flow_exit_nearby(lines, i):
             for cond, _ in iter_if_conditions(line):
+                cond_key = normalize_condition_text(strip_wrapping_parentheses(cond)).strip()
+                if cond_key in active_cond_keys:
+                    continue
                 remain = condition_interval_set(var, cond, assume_true=False)
                 if not interval_set_contains_value(remain, 0.0):
                     return True
@@ -1442,16 +1730,28 @@ def looks_like_floating_expr(expr: str) -> bool:
     return False
 
 
-def has_small_value_guard(var: str, lines: Sequence[str], use_line: int) -> bool:
+def has_small_value_guard(
+    var: str,
+    lines: Sequence[str],
+    use_line: int,
+    active_conds_on_use_line: Optional[Sequence[str]] = None,
+) -> bool:
     v_re = re.escape(var)
     bilateral_if = re.compile(
         rf"\bif\s*\([^)]*\b{v_re}\b\s*[<]=?\s*[^)&|]+&&[^)]*\b{v_re}\b\s*[>]=?\s*-[^)&|]+\)"
     )
+    active_cond_keys = {
+        normalize_condition_text(strip_wrapping_parentheses(c)).strip()
+        for c in (active_conds_on_use_line or [])
+    }
     start = max(0, use_line - 12)
     for i in range(start, use_line + 1):
         line = lines[i]
         if has_flow_exit_nearby(lines, i):
             for cond, _ in iter_if_conditions(line):
+                cond_key = normalize_condition_text(strip_wrapping_parentheses(cond)).strip()
+                if cond_key in active_cond_keys:
+                    continue
                 remain = condition_interval_set(var, cond, assume_true=False)
                 if interval_set_away_from_zero(remain, SMALL_DENOMINATOR_EPS):
                     return True
@@ -1686,6 +1986,33 @@ def detect_out_of_bounds_risks(fn: FunctionInfo) -> List[Finding]:
             index_expr = m.group(2).strip()
             if not index_expr:
                 continue
+            if is_array_declaration_occurrence(line, m.start(1), m.end()):
+                continue
+            is_lit, in_bounds, lit_idx, known_size = evaluate_literal_index_against_container_size(
+                index_expr, container, body_lines_mask, i
+            )
+            if is_lit and in_bounds is True:
+                continue
+            if is_lit and in_bounds is False:
+                code = body_lines_orig[i].strip() if i < len(body_lines_orig) else ""
+                if known_size is not None and known_size > 0:
+                    bound_text = f"0~{known_size - 1}"
+                else:
+                    bound_text = "空区间"
+                findings.append(
+                    Finding(
+                        risk_type="out_of_bounds_risk",
+                        file=fn.file,
+                        line=fn.start_line + 1 + i,
+                        function=fn.name,
+                        detail=(
+                            f"索引访问 '{container}[{index_expr}]' 超出已识别容量范围 "
+                            f"(容量={known_size}，有效索引={bound_text})。"
+                        ),
+                        code=code,
+                    )
+                )
+                continue
             if looks_like_integer_literal(index_expr):
                 pass
             elif '"' in index_expr or "'" in index_expr:
@@ -1752,6 +2079,9 @@ def detect_divide_by_zero_risks(fn: FunctionInfo) -> List[Finding]:
 
             ids = extract_identifiers(d if not (d.startswith("(") and d.endswith(")")) else d[1:-1])
             line_conds = active_conds_by_line[i] if i < len(active_conds_by_line) else []
+            guarded_nonzero_by_expr_cond = any(
+                condition_implies_expr_away_from_zero(d, cond) for cond in line_conds
+            )
             if not ids:
                 if looks_like_floating_expr(d) and is_tiny_nonzero_literal(d):
                     code = body_lines_orig[i].strip() if i < len(body_lines_orig) else ""
@@ -1770,7 +2100,9 @@ def detect_divide_by_zero_risks(fn: FunctionInfo) -> List[Finding]:
                     )
                 continue
 
-            guarded_nonzero = any(has_nonzero_guard(var, body_lines_mask, i) for var in ids)
+            guarded_nonzero = guarded_nonzero_by_expr_cond or any(
+                has_nonzero_guard(var, body_lines_mask, i, line_conds) for var in ids
+            )
             if not guarded_nonzero and line_conds:
                 guarded_nonzero = any(
                     condition_implies_nonzero(var, cond)
@@ -1800,8 +2132,13 @@ def detect_divide_by_zero_risks(fn: FunctionInfo) -> List[Finding]:
             if not likely_floating:
                 continue
 
-            has_near_zero_guard = has_expr_small_value_guard(d, body_lines_mask, i) or any(
-                has_small_value_guard(var, body_lines_mask, i) for var in floating_ids
+            has_near_zero_guard = (
+                guarded_nonzero_by_expr_cond
+                or has_expr_small_value_guard(d, body_lines_mask, i)
+                or any(
+                    has_small_value_guard(var, body_lines_mask, i, line_conds)
+                    for var in floating_ids
+                )
             )
             if not has_near_zero_guard and line_conds:
                 vars_for_cond = floating_ids if floating_ids else ids
@@ -1872,11 +2209,17 @@ def scan(paths: Sequence[str], declared_only: bool = False) -> dict:
         key=lambda x: (x.file.lower(), x.line, x.function, x.risk_type),
     )
 
+    null_count = sum(1 for f in findings if f.risk_type == "null_pointer_risk")
+    oob_count = sum(1 for f in findings if f.risk_type == "out_of_bounds_risk")
+    divide_total_count = sum(
+        1 for f in findings if f.risk_type in {"divide_by_zero_risk", "small_denominator_risk"}
+    )
+
     summary = {
-        "null_pointer_risk": sum(1 for f in findings if f.risk_type == "null_pointer_risk"),
-        "out_of_bounds_risk": sum(1 for f in findings if f.risk_type == "out_of_bounds_risk"),
-        "divide_by_zero_risk": sum(1 for f in findings if f.risk_type == "divide_by_zero_risk"),
-        "small_denominator_risk": sum(1 for f in findings if f.risk_type == "small_denominator_risk"),
+        "null_pointer_risk": null_count,
+        "out_of_bounds_risk": oob_count,
+        # Unified count: includes near-zero denominator findings.
+        "divide_by_zero_risk": divide_total_count,
     }
     findings_dicts: List[dict] = []
     for f in findings:
@@ -1884,7 +2227,11 @@ def scan(paths: Sequence[str], declared_only: bool = False) -> dict:
         row["risk_type_zh"] = RISK_TYPE_ZH.get(f.risk_type, f.risk_type)
         findings_dicts.append(row)
 
-    summary_zh = {RISK_TYPE_ZH.get(k, k): v for k, v in summary.items()}
+    summary_zh = {
+        "空指针风险": null_count,
+        "数组越界风险": oob_count,
+        "除0风险": divide_total_count,
+    }
     scan_mode = "declared_only" if declared_only else "all_definitions"
 
     return {
