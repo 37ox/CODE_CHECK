@@ -55,3 +55,15 @@ JSON 输出字段：
 - 本工具为启发式规则引擎，不是完整编译器语义分析。
 - 目标是快速发现高概率风险点，结果应结合人工复核。
 - 对跨函数、跨文件、宏展开后的深层语义不做完整求解。
+
+## 回归自测
+已内置一组规则回归用例与对比脚本：
+- 用例文件：`sample/regression_cases.cpp`
+- 自测脚本：`selfcheck_regression.py`
+
+运行方式：
+```bash
+python selfcheck_regression.py
+```
+
+脚本会按函数维度对比“预期风险类别集合”和“扫描实际结果”，输出 `PASS/FAIL`。

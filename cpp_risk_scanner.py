@@ -1883,7 +1883,12 @@ def parse_denominators(line: str) -> List[str]:
             i += 1
             continue
 
-        m = re.match(r"[A-Za-z_]\w*|(0x[0-9A-Fa-f]+|\d+)(\.\d+)?([uUlLfF]+)?", line[j:])
+        m = re.match(
+            r"[A-Za-z_]\w*|"
+            r"[-+]?(?:0x[0-9A-Fa-f]+|(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"
+            r"(?:[uUlLfF]+)?",
+            line[j:],
+        )
         if m:
             dens.append(m.group(0).strip())
             i = j + len(m.group(0))
@@ -1892,6 +1897,47 @@ def parse_denominators(line: str) -> List[str]:
         i += 1
 
     return dens
+
+
+def has_top_level_add_sub(expr: str) -> bool:
+    s = strip_wrapping_parentheses(expr).strip()
+    if not s:
+        return False
+
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            continue
+        if depth != 0 or ch not in {"+", "-"}:
+            continue
+
+        j = i - 1
+        while j >= 0 and s[j].isspace():
+            j -= 1
+        if j < 0:
+            # unary sign at expression start
+            continue
+
+        prev = s[j]
+        if prev in "([*/%+-,:<>=!&|?":
+            # unary sign after operator
+            continue
+
+        # exponent sign in scientific notation, e.g. 1e-30
+        if prev in {"e", "E"}:
+            k = j - 1
+            while k >= 0 and s[k].isspace():
+                k -= 1
+            if k >= 0 and (s[k].isdigit() or s[k] == "."):
+                continue
+
+        return True
+
+    return False
 
 
 def detect_null_pointer_risks(fn: FunctionInfo) -> List[Finding]:
@@ -1979,6 +2025,7 @@ def detect_out_of_bounds_risks(fn: FunctionInfo) -> List[Finding]:
     findings: List[Finding] = []
     body_lines_orig = fn.body.splitlines()
     body_lines_mask = mask_comments(fn.body).splitlines()
+    pointer_params = set(extract_pointer_params(fn.params_text))
 
     for i, line in enumerate(body_lines_mask):
         for m in INDEX_ACCESS_RE.finditer(line):
@@ -1986,6 +2033,12 @@ def detect_out_of_bounds_risks(fn: FunctionInfo) -> List[Finding]:
             index_expr = m.group(2).strip()
             if not index_expr:
                 continue
+            # For raw pointer parameters, `p[0]` is semantically `*p`.
+            # Let null-pointer rules cover this case to avoid OOB false positives.
+            if container in pointer_params:
+                lit = parse_integer_literal(index_expr)
+                if lit == 0:
+                    continue
             if is_array_declaration_occurrence(line, m.start(1), m.end()):
                 continue
             is_lit, in_bounds, lit_idx, known_size = evaluate_literal_index_against_container_size(
@@ -2079,6 +2132,7 @@ def detect_divide_by_zero_risks(fn: FunctionInfo) -> List[Finding]:
 
             ids = extract_identifiers(d if not (d.startswith("(") and d.endswith(")")) else d[1:-1])
             line_conds = active_conds_by_line[i] if i < len(active_conds_by_line) else []
+            expr_requires_expression_guard = has_top_level_add_sub(d)
             guarded_nonzero_by_expr_cond = any(
                 condition_implies_expr_away_from_zero(d, cond) for cond in line_conds
             )
@@ -2100,10 +2154,12 @@ def detect_divide_by_zero_risks(fn: FunctionInfo) -> List[Finding]:
                     )
                 continue
 
-            guarded_nonzero = guarded_nonzero_by_expr_cond or any(
-                has_nonzero_guard(var, body_lines_mask, i, line_conds) for var in ids
-            )
-            if not guarded_nonzero and line_conds:
+            guarded_nonzero = guarded_nonzero_by_expr_cond
+            if not expr_requires_expression_guard:
+                guarded_nonzero = guarded_nonzero or any(
+                    has_nonzero_guard(var, body_lines_mask, i, line_conds) for var in ids
+                )
+            if not guarded_nonzero and line_conds and not expr_requires_expression_guard:
                 guarded_nonzero = any(
                     condition_implies_nonzero(var, cond)
                     for var in ids
@@ -2132,15 +2188,15 @@ def detect_divide_by_zero_risks(fn: FunctionInfo) -> List[Finding]:
             if not likely_floating:
                 continue
 
-            has_near_zero_guard = (
-                guarded_nonzero_by_expr_cond
-                or has_expr_small_value_guard(d, body_lines_mask, i)
-                or any(
+            has_near_zero_guard = guarded_nonzero_by_expr_cond or has_expr_small_value_guard(
+                d, body_lines_mask, i
+            )
+            if not expr_requires_expression_guard:
+                has_near_zero_guard = has_near_zero_guard or any(
                     has_small_value_guard(var, body_lines_mask, i, line_conds)
                     for var in floating_ids
                 )
-            )
-            if not has_near_zero_guard and line_conds:
+            if not has_near_zero_guard and line_conds and not expr_requires_expression_guard:
                 vars_for_cond = floating_ids if floating_ids else ids
                 has_near_zero_guard = any(
                     condition_implies_away_from_zero(var, cond, SMALL_DENOMINATOR_EPS)
